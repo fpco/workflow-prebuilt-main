@@ -1,0 +1,76 @@
+name: "workflow-prebuilt-main"
+description: "Download prebuilt tool file if exists"
+inputs:
+  file-path:
+    description: "Path to put the tool file. The basename is also the prefix of the artifact."
+    required: true
+  build-folder:
+    description: "Folder contains the tool source."
+    required: true
+  dep-folders:
+    default: ""
+    description: "Folders (comma split) contain the tool dependencies' source."
+    required: false
+  api-token:
+    description: "Github PAT to access API."
+    required: true
+  org-repo:
+    description: "Organization and Repository, split by '/'."
+    required: true
+outputs:
+  prebuilt:
+    description: "If the tool was prebuilt."
+    value: "${{ steps.main.outputs.tool_exist }}"
+  sha:
+    description: "Latest commit of tool."
+    value: "${{ steps.main.outputs.tool_sha }}"
+runs:
+  using: "composite"
+  steps:
+    - id: main
+      shell: bash
+      run: |
+        set -ex -o pipefail
+
+        FILEPATH="${{ inputs.file-path }}"
+        FILENAME="${FILEPATH##*/}"
+
+        cd "${{ inputs.build-folder }}"
+        LATEST_SHA="$(git log . | (grep -Po '(?<=commit ).*$' || true) | head -1)"
+        cd -
+
+        IFS=',' read -ra folders <<< "${{ inputs.dep-folders }}"
+        for i in $(seq 0 $((${#folders[@]} - 1))); do
+          folder="${folders[$i]}"
+          cd "${folder}"
+          DEP_SHA="$(git log . | (grep -Po '(?<=commit ).*$' || true) | head -1)"
+          cd -
+          git merge-base --is-ancestor "${LATEST_SHA}" "${DEP_SHA}" && LATEST_SHA="${DEP_SHA}"
+        done
+        TOOL_SHA="${LATEST_SHA}"
+
+        TOOL_RUN_ID="$(curl --no-progress-meter -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${{ inputs.api-token }}" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repos/${{ inputs.org-repo }}/actions/artifacts" | jq -r ".artifacts | .[] | select(.name == \"${FILENAME}-${TOOL_SHA}\" and .expired == false) | .workflow_run.id" - | head -1)"
+        if [ -n "${TOOL_RUN_ID}" ]; then
+          echo 'tool_exist=true' >> $GITHUB_OUTPUT
+          echo "tool_sha=${TOOL_SHA}" >> $GITHUB_OUTPUT
+          echo "tool_run_id=${TOOL_RUN_ID}" >> $GITHUB_OUTPUT
+          echo "tool_filename=${FILENAME}" >> $GITHUB_OUTPUT
+          echo "tool_path=${FILEPATH%/*}" >> $GITHUB_OUTPUT
+        else
+          echo 'tool_exist=false' >> $GITHUB_OUTPUT
+          echo "tool_sha=" >> $GITHUB_OUTPUT
+        fi
+
+    # The artifacts info can be retrieved via Github API, but funny enough, the download URL of the info returns 404 no matter what. I use a cross-workflow artifact downloading artifact to get the tool.
+    - if: ${{ steps.main.outputs.tool_exist == 'true' }}
+      uses: dawidd6/action-download-artifact@v2
+      with:
+        run_id: "${{ steps.main.outputs.tool_run_id }}"
+        name: "${{ steps.main.outputs.tool_filename }}-${{ steps.main.outputs.tool_sha }}"
+        path: "${{ steps.main.outputs.tool_path }}"
+
+    - shell: bash
+      run: |
+        set -ex -o pipefail
+        # mv "${{ steps.main.outputs.tool_path }}/${{ steps.main.outputs.tool_filename }}-${{ steps.main.outputs.tool_sha }}" "${{ inputs.file-path }}"
+        chmod a+x "${{ inputs.file-path }}" || true
